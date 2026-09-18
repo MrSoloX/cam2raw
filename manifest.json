@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Live Silhouette Cam Engine",
+  "version": "1.2",
+  "description": "Силуэт на белом фоне через MediaPipe без перезагрузок",
+  "permissions": [
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["mediapipe/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+"content_scripts": [
+  {
+    "matches": ["<all_urls>"],
+    "js": ["inject-base-url.js"],
+    "run_at": "document_start",
+    "world": "ISOLATED",
+    "all_frames": true
+  },
+  {
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "run_at": "document_start",
+    "world": "MAIN",
+    "all_frames": true
+  }
+]
+}
