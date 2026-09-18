@@ -423,16 +423,64 @@
     // Прокси getUserMedia
     // ============================================================
     const realGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-    let gumCount = 0, cachedStream = null;
+    let gumCount = 0, cachedStream = null, lastConstraintsHash = null;
+    let trackGenerator = null, trackWriter = null, readerRunning = false;
+
+    // Функция очистки старого пайплайна
+    function cleanupPipeline(reason) {
+        LOG(`  🧹 Очистка пайплайна: ${reason || 'без причины'}`);
+        readerRunning = false;
+        
+        if (trackWriter) {
+            try { trackWriter.releaseLock(); } catch(e) {}
+            trackWriter = null;
+        }
+        
+        if (cachedStream) {
+            cachedStream.getTracks().forEach(t => {
+                try { t.stop(); } catch(e) {}
+            });
+            cachedStream = null;
+        }
+        
+        trackGenerator = null;
+        lastConstraintsHash = null;
+    }
+    
+    // Хэш для constraints
+    function hashConstraints(c) {
+        return JSON.stringify(c);
+    }
 
     const fakeGUM = async function(constraints) {
         gumCount++;
+        const constraintsHash = hashConstraints(constraints);
         LOG(`📷 GUM #${gumCount}: active=${window.__fadeCamActive}, mode=${window.__fadeCamMode}`);
-        LOG(`  constraints: ${JSON.stringify(constraints)}`);
+        LOG(`  constraints hash: ${constraintsHash.substring(0, 80)}...`);
         
-        if (!constraints?.video) return realGUM(constraints);
-        if (cachedStream?.active) {
-            LOG(`  ♻️ возвращаю кэш (active=${cachedStream.active})`);
+        if (!constraints?.video) {
+            LOG(`  ⚠️ Нет видео в constraints, возвращаю оригинальный GUM`);
+            return realGUM(constraints);
+        }
+
+        // СБРОС КЭША если:
+        // 1. Поток неактивен
+        // 2. Constraints изменились
+        // 3. TrackGenerator больше не live
+        const shouldReset = !cachedStream || 
+                           !cachedStream.active || 
+                           constraintsHash !== lastConstraintsHash ||
+                           (trackGenerator && trackGenerator.readyState !== 'live');
+        
+        if (shouldReset && cachedStream) {
+            WARN(`  🔄 Сброс кэша: active=${cachedStream?.active}, constraintsChanged=${constraintsHash !== lastConstraintsHash}, tgReady=${trackGenerator?.readyState}`);
+            cleanupPipeline('изменение условий');
+        }
+        
+        lastConstraintsHash = constraintsHash;
+
+        if (cachedStream?.active && trackGenerator?.readyState === 'live') {
+            LOG(`  ♻️ возвращаю кэш (active=${cachedStream.active}, tg=${trackGenerator.readyState})`);
             return cachedStream;
         }
 
@@ -454,15 +502,18 @@
         }
 
         const tg = new MediaStreamTrackGenerator({ kind: "video" });
+        trackGenerator = tg;  // Сохраняем ссылку глобально
         const wr = tg.writable.getWriter();
+        trackWriter = wr;  // Сохраняем ссылку глобально
         let running = true, autoTs = 0, frames = 0;
 
         if (stream?.getVideoTracks().length) {
             const tp = new MediaStreamTrackProcessor({ track: stream.getVideoTracks()[0] });
             const rd = tp.readable.getReader();
+            readerRunning = true;
             (async () => {
                 try {
-                    while (running && tg.readyState === 'live') {
+                    while (running && tg.readyState === 'live' && readerRunning) {
                         const { value: f, done } = await rd.read();
                         if (done) break;
                         const outputFrame = processFrame(f);
@@ -471,29 +522,42 @@
                         try {
                             await wr.write(outputFrame);
                         } catch (writeErr) {
+                            WARN(`  ⚠️ Ошибка записи кадра: ${writeErr.message}`);
                             outputFrame.close();
                             running = false;
                             break;
                         }
                         if (++frames % 300 === 1) LOG(`🎞️ ${frames} mode:${window.__fadeCamMode} ok:${segSuccessCount} err:${segErrorCount}`);
                     }
-                } catch(e) { ERR(`Конвейер: ${e.message}`); }
-                finally { try { rd.releaseLock(); } catch(e) {} }
+                } catch(e) { ERR(`Конвейер: ${e.message}`); running = false; }
+                finally { 
+                    try { rd.releaseLock(); } catch(e) {} 
+                    LOG(`  🏁 Reader завершен`);
+                }
             })();
         } else {
+            WARN(`  ⚠️ Нет видеотреков в потоке от realGUM`);
             (async () => {
                 try {
-                    while (running && tg.readyState === 'live') {
+                    while (running && tg.readyState === 'live' && readerRunning) {
                         const f = processFrame(null);
                         f.timestamp = autoTs; autoTs += 40000;
                         try { await wr.write(f); } catch(e) { f.close(); running = false; break; }
                         await new Promise(r => setTimeout(r, 40));
                     }
-                } catch(e) { ERR(`Авто: ${e.message}`); }
+                } catch(e) { ERR(`Авто: ${e.message}`); running = false; }
             })();
         }
 
-        tg.onended = () => { running = false; wr.releaseLock(); cachedStream = null; LOG(`TrackGenerator onended`); };
+        tg.onended = () => { 
+            WARN(`  🛑 TrackGenerator onended`);
+            running = false; 
+            readerRunning = false;
+            try { wr.releaseLock(); } catch(e) {} 
+            cachedStream = null; 
+            trackGenerator = null;
+            trackWriter = null;
+        };
         const fs = new MediaStream([tg]);
         if (stream) stream.getAudioTracks().forEach(t => fs.addTrack(t));
         cachedStream = fs;
